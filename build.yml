@@ -1,0 +1,149 @@
+name: Build ProPlayer Studio
+
+# The repo only needs two things:
+#   source.zip                      (all the code)
+#   .github/workflows/build.yml     (this file)
+# The code is also found if it was uploaded as loose files or inside a folder.
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test (ffmpeg + stand-in AI engine)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find the source code
+        id: src
+        shell: bash
+        run: |
+          if [ -f source.zip ]; then
+            rm -rf _src && mkdir _src && unzip -q -o source.zip -d _src
+            root=_src
+          else
+            root=.
+          fi
+          gm=$(find "$root" -name go.mod -not -path "*/installer/*" -not -path "*/.git/*" | awk '{ print length($0) " " $0 }' | sort -n | head -1 | cut -d' ' -f2-)
+          if [ -z "$gm" ]; then echo "::error::go.mod not found. Upload source.zip to the root of the repo."; exit 1; fi
+          dir=$(cd "$(dirname "$gm")" && pwd)
+          echo "Source folder: $dir"
+          ls -la "$dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Vet
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: go vet ./...
+
+      - name: Test
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: go test ./... -timeout 20m
+
+  build:
+    name: Build Windows EXE
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find the source code
+        id: src
+        shell: pwsh
+        run: |
+          if (Test-Path source.zip) {
+            if (Test-Path _src) { Remove-Item -Recurse -Force _src }
+            Expand-Archive -Path source.zip -DestinationPath _src -Force
+            $root = "_src"
+          } else {
+            $root = "."
+          }
+          $gm = Get-ChildItem -Path $root -Recurse -Filter go.mod -File |
+                Where-Object { $_.FullName -notmatch '[\\/]installer[\\/]' -and $_.FullName -notmatch '[\\/]\.git[\\/]' } |
+                Sort-Object { $_.FullName.Length } | Select-Object -First 1
+          if (-not $gm) { throw "go.mod not found. Upload source.zip to the root of the repo." }
+          $dir = $gm.DirectoryName
+          Write-Host "Source folder: $dir"
+          Get-ChildItem $dir
+          "dir=$dir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Build ProPlayerStudio.exe
+        shell: pwsh
+        working-directory: ${{ steps.src.outputs.dir }}
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE "dist"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          go build -trimpath -ldflags "-H windowsgui -s -w" -o (Join-Path $out "ProPlayerStudio.exe") .
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+      - name: Smoke test (the EXE starts and answers)
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE "dist\ProPlayerStudio.exe"
+          $pf = Join-Path $env:RUNNER_TEMP "port.txt"
+          if (Test-Path $pf) { Remove-Item $pf }
+          Start-Process -FilePath $exe -ArgumentList "--serve", "`"$pf`"" | Out-Null
+          for ($i = 0; $i -lt 30 -and -not (Test-Path $pf); $i++) { Start-Sleep -Seconds 1 }
+          if (-not (Test-Path $pf)) { throw "ProPlayerStudio.exe did not start" }
+          $url = (Get-Content $pf -Raw).Trim()
+          $s = Invoke-RestMethod -Method Post -Uri ($url + "api/ping")
+          if ($s.state -ne "idle") { throw "unexpected state: $($s.state)" }
+          $page = Invoke-WebRequest -UseBasicParsing -Uri $url
+          if ($page.Content -notmatch "ProPlayer Studio") { throw "UI page is wrong" }
+          try { Invoke-RestMethod -Method Post -Uri ($url + "api/quit") | Out-Null } catch {}
+          Write-Host "Smoke test passed: $url"
+
+      - name: Build installer (ProPlayerStudio-Setup.exe)
+        shell: pwsh
+        working-directory: ${{ steps.src.outputs.dir }}
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE "dist"
+          Copy-Item (Join-Path $out "ProPlayerStudio.exe") installer\ProPlayerStudio.exe
+          Push-Location installer
+          go build -trimpath -ldflags "-H windowsgui -s -w" -o (Join-Path $out "ProPlayerStudio-Setup.exe") .
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { throw "installer build failed" }
+          Get-ChildItem $out | Format-Table Name, Length
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProPlayerStudio
+          path: |
+            dist/ProPlayerStudio.exe
+            dist/ProPlayerStudio-Setup.exe
+          if-no-files-found: error
+
+      - name: Publish release (only for tags like v1.0.0)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ProPlayerStudio.exe
+            dist/ProPlayerStudio-Setup.exe
