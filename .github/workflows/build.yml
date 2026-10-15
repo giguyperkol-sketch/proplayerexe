@@ -1,9 +1,10 @@
 name: Build ProPlayer Studio
 
-# The repo only needs two things:
-#   source.zip                      (all the code)
-#   .github/workflows/build.yml     (this file)
+# The repo needs only two things:
+#   source.zip                      all the code (the workflow unzips it)
+#   .github/workflows/build.yml     this file
 # The code is also found if it was uploaded as loose files or inside a folder.
+# Result: Actions > the run > Artifacts > ProPlayerStudio (ProPlayerStudio.exe + ProPlayerStudio-Setup.exe)
 
 on:
   push:
@@ -12,9 +13,12 @@ on:
 permissions:
   contents: write
 
+env:
+  GO_VERSION: "1.22"
+
 jobs:
   test:
-    name: Test (ffmpeg + stand-in AI engine)
+    name: Test (real ffmpeg + stand-in AI engine)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,19 +42,25 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: ${{ env.GO_VERSION }}
           cache: false
 
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
-      - name: Vet
+      - name: Download Go modules
         working-directory: ${{ steps.src.outputs.dir }}
-        run: go vet ./...
+        run: go mod tidy
 
-      - name: Test
+      - name: Vet (Linux and Windows code)
         working-directory: ${{ steps.src.outputs.dir }}
-        run: go test ./... -timeout 20m
+        run: |
+          go vet ./...
+          GOOS=windows GOARCH=amd64 go vet ./...
+
+      - name: Test the whole pipeline (every mode, every slider extreme)
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: go test ./... -v -timeout 20m
 
   build:
     name: Build Windows EXE
@@ -81,7 +91,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: ${{ env.GO_VERSION }}
           cache: false
 
       - name: Build ProPlayerStudio.exe
@@ -92,12 +102,14 @@ jobs:
           GOARCH: amd64
           CGO_ENABLED: "0"
         run: |
+          go mod tidy
+          if ($LASTEXITCODE -ne 0) { throw "go mod tidy failed" }
           $out = Join-Path $env:GITHUB_WORKSPACE "dist"
           New-Item -ItemType Directory -Force $out | Out-Null
           go build -trimpath -ldflags "-H windowsgui -s -w" -o (Join-Path $out "ProPlayerStudio.exe") .
           if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
-      - name: Smoke test (the EXE starts and answers)
+      - name: Engine test (starts and answers)
         shell: pwsh
         run: |
           $exe = Join-Path $env:GITHUB_WORKSPACE "dist\ProPlayerStudio.exe"
@@ -109,10 +121,24 @@ jobs:
           $url = (Get-Content $pf -Raw).Trim()
           $s = Invoke-RestMethod -Method Post -Uri ($url + "api/ping")
           if ($s.state -ne "idle") { throw "unexpected state: $($s.state)" }
+          Write-Host "Engine version: $($s.version)"
           $page = Invoke-WebRequest -UseBasicParsing -Uri $url
           if ($page.Content -notmatch "ProPlayer Studio") { throw "UI page is wrong" }
           try { Invoke-RestMethod -Method Post -Uri ($url + "api/quit") | Out-Null } catch {}
-          Write-Host "Smoke test passed: $url"
+          Write-Host "Engine test passed: $url"
+
+      - name: Window test (opens the real window for a few seconds)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE "dist\ProPlayerStudio.exe"
+          $env:PPS_WINDOW_TEST = "1"
+          $p = Start-Process -FilePath $exe -PassThru
+          if (-not $p.WaitForExit(90000)) { $p.Kill(); throw "the window did not close by itself" }
+          Write-Host "Window test exit code: $($p.ExitCode)  (0 = the window opened and the page loaded)"
+          $log = Join-Path $env:LOCALAPPDATA "ProPlayer Studio\studio-log.txt"
+          if (Test-Path $log) { Get-Content $log }
+          if ($p.ExitCode -ne 0) { throw "window test failed" }
 
       - name: Build installer (ProPlayerStudio-Setup.exe)
         shell: pwsh
@@ -140,7 +166,7 @@ jobs:
             dist/ProPlayerStudio-Setup.exe
           if-no-files-found: error
 
-      - name: Publish release (only for tags like v1.0.0)
+      - name: Publish release (only for tags like v2.0.0)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
